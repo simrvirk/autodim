@@ -1,0 +1,13 @@
+# FAI Dimension Numberer — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# GUI framework
+PyQt6>=6.4.0
+
+# PDF rendering and annotation (PyMuPDF)
+PyMuPDF>=1.23.0
+
+# (No external AI API required — dimension detection uses built-in regex)
+
+# Excel template reading and writing
+openpyxl>=3.1.0

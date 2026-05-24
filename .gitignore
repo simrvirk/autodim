@@ -1,0 +1,32 @@
+# PyInstaller output
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Session sidecars generated at runtime
+*.autodim
+
+# Config saved at runtime
+config.json
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code workspace settings
+.claude/
