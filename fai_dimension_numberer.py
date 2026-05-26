@@ -56,6 +56,7 @@ from PyQt6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontMetricsF,
     QImage,
     QPainter,
     QPainterPath,
@@ -79,6 +80,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -156,8 +158,11 @@ CATEGORY_COLORS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _nominal_text(text: str) -> str:
-    """Strip tolerance suffixes and return only the nominal value string."""
+    """Strip count prefix and tolerance suffixes; return only the nominal value."""
     t = text.strip()
+    # Remove leading count multiplier: "3X ", "2x ", "4× ", etc.
+    t = re.sub(r"^\d+\s*[xX×]\s*", "", t)
+    # Remove trailing tolerance suffixes
     t = re.sub(r"\s*[±]\s*[\d.]+.*$", "", t)
     t = re.sub(r"\s*\+[\d.]+\s*/?\s*-[\d.]+.*$", "", t)
     t = re.sub(r"\s*\+[\d.]+\s+-[\d.]+.*$", "", t)
@@ -518,6 +523,7 @@ class CalloutItem(QGraphicsItem):
         color: str,
         on_moved: Optional[Callable] = None,
         on_drag_complete: Optional[Callable] = None,
+        on_context_menu: Optional[Callable] = None,
     ) -> None:
         super().__init__()
         self.number = number
@@ -525,6 +531,7 @@ class CalloutItem(QGraphicsItem):
         self.color = QColor(color)
         self._on_moved = on_moved
         self._on_drag_complete = on_drag_complete
+        self._on_context_menu = on_context_menu
         self._drag_start_pos: Optional[QPointF] = None
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -570,24 +577,27 @@ class CalloutItem(QGraphicsItem):
             rr = r + 5.0
             painter.drawEllipse(QRectF(-rr, -rr, 2 * rr, 2 * rr))
 
-        # Drop shadow
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 55)))
-        painter.drawEllipse(QRectF(-r + 2, -r + 2, 2 * r, 2 * r))
-
         # White fill + colored border
         painter.setPen(QPen(self.color, 2.0))
         painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
         painter.drawEllipse(QRectF(-r, -r, 2 * r, 2 * r))
 
-        # Number label
-        font = QFont("Arial", max(6, int(r * 0.72)), QFont.Weight.Bold)
+        # Number label — font shrinks automatically so it always fits the circle
+        num_str = str(self.number)
+        base_pt = max(6.0, r * 0.72)
+        font = QFont("Arial", 1, QFont.Weight.Bold)
+        font.setPointSizeF(base_pt)
+        # Available horizontal space = diameter minus 2 px margin each side
+        available_w = max(1.0, 2.0 * r - 4.0)
+        text_w = QFontMetricsF(font).horizontalAdvance(num_str)
+        if text_w > available_w:
+            font.setPointSizeF(max(5.0, base_pt * available_w / text_w))
         painter.setFont(font)
         painter.setPen(QPen(self.color))
         painter.drawText(
             QRectF(-r, -r, 2 * r, 2 * r),
             Qt.AlignmentFlag.AlignCenter,
-            str(self.number),
+            num_str,
         )
 
     def mousePressEvent(self, event) -> None:
@@ -616,6 +626,12 @@ class CalloutItem(QGraphicsItem):
         ):
             self._on_moved(self, value)
         return super().itemChange(change, value)
+
+    def contextMenuEvent(self, event) -> None:
+        """Right-click on a callout circle — fire the context-menu callback."""
+        if self._on_context_menu is not None:
+            self._on_context_menu(self, event.screenPos())
+        event.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -1743,7 +1759,7 @@ class MainWindow(QMainWindow):
                 pg = bp["page"]
                 if pg >= len(self.pdf_doc):
                     continue
-                r = bp["r_pt"] + 2      # shadow extends exactly 2 pt past circle edge
+                r = bp["r_pt"]
                 cx, cy = bp["x"], bp["y"]
                 try:
                     self.pdf_doc[pg].add_redact_annot(
@@ -1963,6 +1979,7 @@ class MainWindow(QMainWindow):
             color=self.config.callout_color,
             on_moved=on_moved,
             on_drag_complete=on_drag_complete,
+            on_context_menu=self._on_callout_context_menu,
         )
         item.setPos(dim["callout_x"] * RENDER_ZOOM, dim["callout_y"] * RENDER_ZOOM)
         return item
@@ -2249,6 +2266,47 @@ class MainWindow(QMainWindow):
                     self._update_callout_numbers()
                 return
 
+    def _on_callout_context_menu(self, item: "CalloutItem", screen_pos) -> None:
+        """Show a right-click context menu on a callout circle."""
+        # Find which dimension this item belongs to
+        dim_index: Optional[int] = None
+        for i, dim in enumerate(self.dimensions):
+            if dim.get("callout_item") is item:
+                dim_index = i
+                break
+        if dim_index is None:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #2B2D42;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 4px 0px;
+                color: #EEEEEE;
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 7px 20px 7px 12px;
+                border-radius: 4px;
+                margin: 2px 4px;
+            }
+            QMenu::item:selected {
+                background-color: #4A90D9;
+                color: white;
+            }
+        """)
+        edit_action   = menu.addAction("✏   Edit Dimension")
+        menu.addSeparator()
+        delete_action = menu.addAction("🗑   Delete Dimension")
+
+        chosen = menu.exec(screen_pos)
+        if chosen is edit_action:
+            self._on_edit_requested(dim_index)
+        elif chosen is delete_action:
+            self._on_callout_delete_requested(item)
+
     # =======================================================================
     # Settings
     # =======================================================================
@@ -2361,9 +2419,11 @@ class MainWindow(QMainWindow):
         qt_color = QColor(self.config.callout_color)
         stroke_rgb = (qt_color.redF(), qt_color.greenF(), qt_color.blueF())
 
-        # Larger font ratio so numbers fill the circle comfortably.
+        # Base font size — will be scaled per number to always fit the circle.
         # diameter = 2*r_pt; target ≈ 60 % of diameter → r_pt * 1.2
-        font_sz = max(8.0, r_pt * 1.2)
+        base_font_sz = max(8.0, r_pt * 1.2)
+        # Available width inside the circle border (2 pt margin each side)
+        _available_w = max(1.0, 2.0 * r_pt - 4.0)
 
         dims_by_page: dict[int, list] = {}
         for dim in active_dims:
@@ -2381,16 +2441,19 @@ class MainWindow(QMainWindow):
 
                 circle_rect = fitz.Rect(cx - r_pt, cy - r_pt, cx + r_pt, cy + r_pt)
 
-                # ── Drop shadow (offset 2 pt, 22 % opacity) ──────────────
-                shadow_rect = fitz.Rect(
-                    circle_rect.x0 + 2, circle_rect.y0 + 2,
-                    circle_rect.x1 + 2, circle_rect.y1 + 2,
-                )
-                page.draw_oval(
-                    shadow_rect,
-                    color=None, fill=(0.0, 0.0, 0.0),
-                    fill_opacity=0.22, width=0,
-                )
+                # ── Font size: shrink to fit wide numbers inside the circle ──
+                # Measure at the default size, then scale down proportionally
+                # so the text always fits within the available diameter.
+                try:
+                    tw_default = fitz.get_text_length(
+                        num_str, fontname="hebo", fontsize=base_font_sz
+                    )
+                except AttributeError:
+                    tw_default = base_font_sz * 0.60 * len(num_str)
+                if tw_default > _available_w and tw_default > 0:
+                    font_sz = max(6.0, base_font_sz * _available_w / tw_default)
+                else:
+                    font_sz = base_font_sz
 
                 # ── Circle: white fill + coloured border ─────────────────
                 page.draw_oval(
@@ -2405,13 +2468,12 @@ class MainWindow(QMainWindow):
                 # PyMuPDF version (insert_textbox can silently swallow
                 # text when the rect is just a little too tight).
                 if dim["callout_num"] > 0:
-                    # Horizontal: measure the exact glyph width and centre it.
+                    # Horizontal: measure exact glyph width at final font_sz.
                     try:
                         tw = fitz.get_text_length(
                             num_str, fontname="hebo", fontsize=font_sz
                         )
                     except AttributeError:
-                        # Older PyMuPDF — Helvetica Bold digit ≈ 0.60× em wide
                         tw = font_sz * 0.60 * len(num_str)
                     tx = cx - tw / 2.0
                     # Vertical: insert_text places the baseline at the given
@@ -2446,7 +2508,7 @@ class MainWindow(QMainWindow):
                 pg = bp["page"]
                 if pg >= len(doc):
                     continue
-                r = bp["r_pt"] + 2      # shadow extends exactly 2 pt past circle edge
+                r = bp["r_pt"]
                 cx, cy = bp["x"], bp["y"]
                 doc[pg].add_redact_annot(
                     fitz.Rect(cx - r, cy - r, cx + r, cy + r),
@@ -2476,6 +2538,52 @@ class MainWindow(QMainWindow):
     # =======================================================================
     # Embed annotated pages into an Excel sheet
     # =======================================================================
+
+    @staticmethod
+    def _make_xl_image(XlImage, img_bytes: "io.BytesIO",
+                       raw_width: int, raw_height: int):
+        """Construct an openpyxl Image without requiring a Pillow install.
+
+        openpyxl uses Pillow solely to read the pixel dimensions of an image.
+        Because we already know the exact dimensions from the PyMuPDF pixmap,
+        we can inject a minimal in-process shim that satisfies openpyxl's
+        ``from PIL.Image import open`` call and returns those known dimensions.
+        The real image bytes are stored normally; Pillow is never needed.
+        """
+        import sys
+
+        img_bytes.seek(0)
+        try:
+            return XlImage(img_bytes)           # fast path — Pillow installed
+        except ImportError:
+            pass                                # Pillow absent — use shim
+
+        # Minimal shim: looks like PIL.Image to openpyxl.
+        # openpyxl only calls PIL.Image.open(fp) and reads .size / .format.
+        class _Img:
+            size   = (raw_width, raw_height)
+            format = "PNG"
+
+        class _PIL:
+            @staticmethod
+            def open(_fp):
+                return _Img()
+
+        shim = _PIL()
+        prev_pil       = sys.modules.get("PIL")
+        prev_pil_image = sys.modules.get("PIL.Image")
+        if prev_pil is None:
+            sys.modules["PIL"] = shim
+        if prev_pil_image is None:
+            sys.modules["PIL.Image"] = shim
+        try:
+            img_bytes.seek(0)
+            return XlImage(img_bytes)
+        finally:
+            if prev_pil is None:
+                sys.modules.pop("PIL", None)
+            if prev_pil_image is None:
+                sys.modules.pop("PIL.Image", None)
 
     def _embed_annotated_pages(
         self, wb, active_dims: list, data_sheet_title: str = ""
@@ -2539,7 +2647,7 @@ class MainWindow(QMainWindow):
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img_bytes = io.BytesIO(pix.tobytes("png"))
-            xl_img = XlImage(img_bytes)
+            xl_img = self._make_xl_image(XlImage, img_bytes, pix.width, pix.height)
 
             scale = TARGET_W_PX / pix.width
             xl_img.width  = TARGET_W_PX

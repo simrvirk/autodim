@@ -19,13 +19,203 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Optional
 
 import re
 
 import fitz  # PyMuPDF
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+
+
+# ---------------------------------------------------------------------------
+# Bilateral-tolerance stack detection
+# ---------------------------------------------------------------------------
+
+# Unsigned decimal value — used to recognise tolerance magnitude fragments
+# e.g. "0.20", "0.00", "1.5"
+_PLAIN_DECIMAL_RE = re.compile(r'^\d+\.?\d*$')
+
+# Fallback patterns for the less-common stacked-line layout:
+#   25.00        ← nominal
+#   +0.13        ← explicit plus arm  (starts with '+')
+#   -0.08        ← explicit minus arm (starts with '-')
+_PLUS_ARM_RE  = re.compile(r'^\+\d+\.?\d*$')
+_MINUS_ARM_RE = re.compile(r'^-\d+\.?\d*$')
+# Plain nominal that may have an Ø/R prefix but no trailing sign
+_NOMINAL_RE   = re.compile(r'^[ØøRr⌀∅]?\s*\d+\.?\d*$')
+
+
+def _merge_bilateral_tolerances(blocks: list[dict]) -> list[dict]:
+    """Collapse bilateral-tolerance stacks into the nominal block.
+
+    CAD software renders bilateral tolerances in (at least) two ways:
+
+    Pattern A — inline split (seen in this codebase's target drawings):
+        The nominal text itself ends with '+', the plus-tolerance value is a
+        separate block glued immediately to its right on the same line, and the
+        minus-tolerance value is a block directly below the plus value:
+
+            [2X 1.70+] [0.20]      ← same y; abutting x
+                        [0.00]      ← same x as [0.20]; fractionally lower y
+
+        After merging: "2X 1.70 +0.20/-0.00"
+
+    Pattern B — stacked lines (less common):
+        The three values appear as separate lines below one another:
+
+            25.00        ← nominal
+            +0.13        ← explicit plus arm  (text starts with '+')
+            -0.08        ← explicit minus arm (text starts with '-')
+
+        After merging: "25.00 +0.13/-0.08"
+
+    In both cases the nominal block's text is updated to the combined form and
+    the absorbed tolerance fragments are removed from the returned list.  The
+    combined text is already understood by _parse_tolerances() and
+    _classify_dimension() so no other code needs to change.
+    """
+    if not blocks:
+        return blocks
+
+    # Spatial order: top-to-bottom, left-to-right
+    order = sorted(range(len(blocks)),
+                   key=lambda i: (blocks[i]["y"], blocks[i]["x"]))
+
+    absorbed: set[int] = set()   # original block indices to drop
+
+    # ── Pattern A: nominal text ends with '+' ─────────────────────────────────
+    for si, bi in enumerate(order):
+        if bi in absorbed:
+            continue
+        nom_text_raw = blocks[bi]["text"].strip()
+        if not nom_text_raw.endswith("+"):
+            continue
+
+        nom_block  = blocks[bi]
+        nom_end_x  = nom_block["x"] + nom_block["width"]   # right edge of nominal
+
+        # Find the plus-value block: same y row, x starts where the nominal ends
+        plus_bi: Optional[int] = None
+        for look in range(si + 1, min(si + 12, len(order))):
+            cbi = order[look]
+            if cbi in absorbed:
+                continue
+            c = blocks[cbi]
+            # Must be on approximately the same baseline
+            if abs(c["y"] - nom_block["y"]) > max(nom_block["height"], c["height"]):
+                continue
+            # x must start within a small gap of where the nominal text ends
+            # (allow up to 8 pt gap, and up to 4 pt overlap for rounding)
+            x_gap = c["x"] - nom_end_x
+            if not (-4 <= x_gap <= 8):
+                continue
+            if _PLAIN_DECIMAL_RE.match(c["text"].strip()):
+                plus_bi = cbi
+                break
+
+        if plus_bi is None:
+            continue
+
+        plus_block = blocks[plus_bi]
+
+        # Find the minus-value block: same x range as plus_block, directly below
+        minus_bi: Optional[int] = None
+        for look in range(si + 1, min(si + 15, len(order))):
+            cbi = order[look]
+            if cbi in absorbed or cbi == plus_bi:
+                continue
+            c = blocks[cbi]
+            # Must be strictly below the plus block's top edge
+            if c["y"] <= plus_block["y"]:
+                continue
+            # Must not be too far below (within 4× the plus block's height,
+            # which also handles the overlapping-fraction layout)
+            if c["y"] - plus_block["y"] > plus_block["height"] * 4:
+                break
+            # Must overlap horizontally with the plus block
+            c_x0, c_x1  = c["x"], c["x"] + c["width"]
+            p_x0, p_x1  = plus_block["x"], plus_block["x"] + plus_block["width"]
+            overlap = min(c_x1, p_x1) - max(c_x0, p_x0)
+            if overlap < min(p_x1 - p_x0, c_x1 - c_x0) * 0.25:
+                continue
+            if _PLAIN_DECIMAL_RE.match(c["text"].strip()):
+                minus_bi = cbi
+                break
+
+        # Build combined text: strip trailing '+' from nominal, append tols
+        nom_base  = nom_text_raw[:-1].strip()          # "2X 1.70+" → "2X 1.70"
+        plus_val  = plus_block["text"].strip()
+        minus_val = blocks[minus_bi]["text"].strip() if minus_bi is not None else plus_val
+
+        nom_block["text"] = f"{nom_base} +{plus_val}/-{minus_val}"
+        absorbed.add(plus_bi)
+        if minus_bi is not None:
+            absorbed.add(minus_bi)
+
+    # ── Pattern B: explicit "+X.XX" line below nominal ────────────────────────
+    for si, bi in enumerate(order):
+        if bi in absorbed:
+            continue
+        text = blocks[bi]["text"].strip()
+        if not _PLUS_ARM_RE.match(text):
+            continue
+
+        plus_block = blocks[bi]
+
+        # Search upward (in spatial order) for a plain nominal
+        nom_bi: Optional[int] = None
+        for look in range(si - 1, max(si - 10, -1), -1):
+            cbi = order[look]
+            if cbi in absorbed:
+                continue
+            c = blocks[cbi]
+            if c["y"] >= plus_block["y"]:
+                continue
+            v_gap = plus_block["y"] - (c["y"] + c["height"])
+            if v_gap > plus_block["height"] * 4:
+                break
+            c_x0, c_x1 = c["x"], c["x"] + c["width"]
+            p_x0, p_x1 = plus_block["x"], plus_block["x"] + plus_block["width"]
+            if min(c_x1, p_x1) - max(c_x0, p_x0) < min(p_x1-p_x0, c_x1-c_x0) * 0.25:
+                continue
+            if _NOMINAL_RE.match(c["text"].strip()):
+                nom_bi = cbi
+                break
+
+        if nom_bi is None:
+            continue
+
+        # Search downward for the explicit minus arm
+        minus_bi = None
+        for look in range(si + 1, min(si + 10, len(order))):
+            cbi = order[look]
+            if cbi in absorbed:
+                continue
+            c = blocks[cbi]
+            if c["y"] <= plus_block["y"]:
+                continue
+            if c["y"] - (plus_block["y"] + plus_block["height"]) > plus_block["height"] * 4:
+                break
+            c_x0, c_x1 = c["x"], c["x"] + c["width"]
+            p_x0, p_x1 = plus_block["x"], plus_block["x"] + plus_block["width"]
+            if min(c_x1, p_x1) - max(c_x0, p_x0) < min(p_x1-p_x0, c_x1-c_x0) * 0.25:
+                continue
+            if _MINUS_ARM_RE.match(c["text"].strip()):
+                minus_bi = cbi
+                break
+
+        plus_val = text.lstrip("+")
+        nom = blocks[nom_bi]
+        if minus_bi is not None:
+            minus_val = blocks[minus_bi]["text"].strip().lstrip("-")
+            nom["text"] = f"{nom['text'].strip()} +{plus_val}/-{minus_val}"
+            absorbed.add(minus_bi)
+        else:
+            nom["text"] = f"{nom['text'].strip()} +{plus_val}/-{plus_val}"
+        absorbed.add(bi)
+
+    return [b for i, b in enumerate(blocks) if i not in absorbed]
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +242,13 @@ def _classify_dimension(text: str) -> tuple[Optional[str], float]:
         return None, 0.0
     # Skip plain revision letters / single uppercase words (not datum context)
     if re.match(r'^[A-Z]{2,}$', t) and not re.search(r'\d', t):
+        return None, 0.0
+
+    # --- Standalone bilateral-tolerance arm (e.g. "+0.13" or "-0.08") -------
+    # These are the upper/lower tolerance lines typeset below a nominal value.
+    # _merge_bilateral_tolerances() folds them into the nominal before this
+    # function is called; any that still reach here are not standalone dims.
+    if re.match(r'^[+-]\d+\.?\d*$', t):
         return None, 0.0
 
     # --- Angular ---
@@ -127,6 +324,73 @@ def _classify_dimension(text: str) -> tuple[Optional[str], float]:
 
 
 # ---------------------------------------------------------------------------
+# GD&T feature-control-frame detection (vector-path based)
+# ---------------------------------------------------------------------------
+
+def _collect_gdt_cells(page) -> list[tuple[float, float, float, float]]:
+    """Return (x0, y0, x1, y1) for every small rectangular vector path that
+    is likely a GD&T feature-control-frame symbol cell.
+
+    In a CAD-exported PDF the GD&T symbol (flatness, cylindricity, etc.) is
+    drawn as vector graphics inside a small rectangular cell.  The tolerance
+    value (e.g. "0.2") is a separate text block sitting immediately to the
+    right of that cell.
+
+    The distinguishing geometry of a GD&T symbol cell vs a dimension-line
+    arrowhead (the other common small rectangle in engineering drawings):
+
+      • GD&T cell   — wide and flat: width ≈ 12–35 pt, height ≈ 5–15 pt,
+                      aspect ratio (w/h) typically > 1.5
+      • Arrowhead   — roughly square or taller: width ≈ height ≈ 7–10 pt,
+                      aspect ratio ≈ 0.8–1.1
+
+    We therefore require:
+      • unfilled (fill is None)
+      • width  10 – 40 pt
+      • height  4 – 20 pt
+      • width  > height × 1.3   (explicitly wider than tall → not an arrowhead)
+    """
+    cells: list[tuple[float, float, float, float]] = []
+    try:
+        for path in page.get_drawings():
+            r = path.get("rect")
+            if r is None:
+                continue
+            w = r.x1 - r.x0
+            h = r.y1 - r.y0
+            if (path.get("fill") is None
+                    and path.get("color") is not None
+                    and 10 <= w < 40          # wide enough for a symbol glyph
+                    and 4 < h < 20            # one text-line tall
+                    and w > h * 1.3):         # wider than tall → not an arrowhead
+                cells.append((r.x0, r.y0, r.x1, r.y1))
+    except Exception:
+        pass   # get_drawings() unavailable on this PDF variant
+    return cells
+
+
+def _is_gdt_value(block: dict,
+                  cells: list[tuple[float, float, float, float]]) -> bool:
+    """Return True if *block* sits immediately to the right of a GD&T cell.
+
+    Criteria:
+      • The block's left edge is 0–15 pt to the right of the cell's right edge.
+      • The block and the cell share at least 30 % of the shorter one's height.
+    """
+    bx0 = block["x"]
+    by0 = block["y"]
+    by1 = by0 + block["height"]
+    for cx0, cy0, cx1, cy1 in cells:
+        x_gap = bx0 - cx1
+        if not (0 <= x_gap <= 15):
+            continue
+        overlap = min(by1, cy1) - max(by0, cy0)
+        if overlap >= min(by1 - by0, cy1 - cy0) * 0.30:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Public API — PDF dimension detection
 # ---------------------------------------------------------------------------
 
@@ -191,6 +455,11 @@ def detect_dimensions(pdf_path: str, page_num: int = 0) -> list[dict]:
     # one block, causing dimension strings like "11.00 +/- 0.2", "2X", "6.00"
     # to be concatenated into a single entry and mis-classified.
     raw_dict = page.get_text("dict")
+
+    # Collect GD&T symbol cells *before* closing the doc — get_drawings()
+    # requires the page object to still be alive.
+    gdt_cells = _collect_gdt_cells(page)
+
     doc.close()
 
     text_blocks: list[dict] = []
@@ -223,12 +492,33 @@ def detect_dimensions(pdf_path: str, page_num: int = 0) -> list[dict]:
         )
 
     # ------------------------------------------------------------------
-    # 3. Classify each text block with regex patterns
+    # 3. Merge bilateral-tolerance stacks before classification.
+    #
+    # Drawing CAD software often typsets a nominal and its bilateral tolerance
+    # as three separate text lines stacked vertically:
+    #
+    #     25.00          ← nominal
+    #     +0.13          ← upper tolerance arm
+    #     -0.08          ← lower tolerance arm
+    #
+    # Without this step the "+0.13" line is mis-classified as a dimension.
+    # The merge folds the arms into the nominal ("25.00 +0.13/-0.08") and
+    # removes the standalone tolerance lines from the block list.
+    # ------------------------------------------------------------------
+    text_blocks = _merge_bilateral_tolerances(text_blocks)
+
+    # ------------------------------------------------------------------
+    # 4. Classify each text block with regex patterns
     # ------------------------------------------------------------------
     results: list[dict] = []
     for block in text_blocks:
         category, confidence = _classify_dimension(block["text"])
         if category is None:
+            continue
+        # Skip values that live inside a GD&T feature control frame.
+        # The frame's symbol cell is a small rectangular vector path
+        # immediately to the left of the tolerance value text.
+        if gdt_cells and _is_gdt_value(block, gdt_cells):
             continue
         results.append({
             "index"     : block["index"],
