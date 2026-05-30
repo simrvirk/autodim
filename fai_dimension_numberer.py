@@ -1297,12 +1297,15 @@ def _smart_callout_pos(
     block: dict,
     placed: list[tuple[float, float]],
     r_pt: float,
+    prefer_left: bool = False,
 ) -> tuple[float, float]:
     """Pick the callout centre with fewest overlaps from 8 candidate positions.
 
-    Candidates are tried in preference order: right, left, above, below,
-    then the four diagonals.  The first candidate with zero overlaps wins;
-    otherwise the one with the fewest overlaps is returned.
+    When prefer_left is True (tolerance dimensions whose ± or +/− text extends
+    to the right of the nominal), left is tried first so the circle doesn't
+    land on top of the tolerance annotation.  Otherwise right is tried first.
+    The first candidate with zero overlaps wins; otherwise the fewest-overlap
+    position is used.
     """
     bx = block["x"]
     by = block["y"]
@@ -1312,16 +1315,28 @@ def _smart_callout_pos(
     bcy = by + bh / 2.0
     gap = r_pt + 4.0
 
-    candidates = [
-        (bx + bw + gap,  bcy),           # right (preferred)
-        (bx - gap,       bcy),           # left
-        (bcx,            by - gap),      # above
-        (bcx,            by + bh + gap), # below
-        (bx + bw + gap,  by - gap),      # upper-right
-        (bx - gap,       by - gap),      # upper-left
-        (bx + bw + gap,  by + bh + gap), # lower-right
-        (bx - gap,       by + bh + gap), # lower-left
-    ]
+    if prefer_left:
+        candidates = [
+            (bx - gap,       bcy),           # left (preferred — tolerance text is to the right)
+            (bx + bw + gap,  bcy),           # right
+            (bcx,            by - gap),      # above
+            (bcx,            by + bh + gap), # below
+            (bx - gap,       by - gap),      # upper-left
+            (bx + bw + gap,  by - gap),      # upper-right
+            (bx - gap,       by + bh + gap), # lower-left
+            (bx + bw + gap,  by + bh + gap), # lower-right
+        ]
+    else:
+        candidates = [
+            (bx + bw + gap,  bcy),           # right (preferred)
+            (bx - gap,       bcy),           # left
+            (bcx,            by - gap),      # above
+            (bcx,            by + bh + gap), # below
+            (bx + bw + gap,  by - gap),      # upper-right
+            (bx - gap,       by - gap),      # upper-left
+            (bx + bw + gap,  by + bh + gap), # lower-right
+            (bx - gap,       by + bh + gap), # lower-left
+        ]
 
     best = candidates[0]
     min_overlaps: Optional[int] = None
@@ -2849,7 +2864,8 @@ class MainWindow(QMainWindow):
         ]
 
         for raw in dims:
-            cx, cy = _smart_callout_pos(raw, placed, r_pt)
+            _, plus_t, _ = _parse_tolerances(raw.get("text", ""))
+            cx, cy = _smart_callout_pos(raw, placed, r_pt, prefer_left=(plus_t is not None))
             placed.append((cx, cy))
 
             entry: dict[str, Any] = dict(raw)
@@ -3473,7 +3489,8 @@ class MainWindow(QMainWindow):
             ]
 
             for raw in raw_dims:
-                cx, cy = _smart_callout_pos(raw, placed, r_pt)
+                _, plus_t, _ = _parse_tolerances(raw.get("text", ""))
+                cx, cy = _smart_callout_pos(raw, placed, r_pt, prefer_left=(plus_t is not None))
                 placed.append((cx, cy))
 
                 entry = dict(raw)
